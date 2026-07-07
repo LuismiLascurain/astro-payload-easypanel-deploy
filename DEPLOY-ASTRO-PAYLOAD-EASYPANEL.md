@@ -3,11 +3,17 @@
 > **Nota de versiones (julio 2026):** este manual se escribió y validó con
 > **Astro 5 + Payload 3 + Node 22**. Astro 6 y 7 exigen **Node 22.12+** (los
 > Dockerfiles de aquí ya usan `node:22-slim`, verifica la minor). He validado
-> Astro 7 en sitios estáticos sin CMS sin ninguna incidencia; la combinación
-> completa Astro 7 + Payload con este patrón está pendiente de validar — si
-> la pruebas, los puntos a vigilar son el compilador estricto (HTML inválido
-> que antes se auto-corregía ahora rompe el build) y Vite 8/Rolldown si
-> tienes configuración custom de Vite.
+> Astro 7 en sitios estáticos sin CMS sin ninguna incidencia.
+>
+> **Actualización (laskurain.es, 2026-07-07): la combinación completa
+> Astro 7 + Payload 3 está VALIDADA en producción** con este patrón (monorepo
+> pnpm, Next 16 webpack, `node:22-alpine`). El despliegue destapó **cuatro
+> trampas nuevas**, todas en §6.15–§6.18: el marcador `dev` de las migraciones
+> colgando `migrate` (§6.15), el type-check de `next build` más estricto que
+> dev (§6.16), la config de Payload importando de otro workspace y reventando
+> en runtime (§6.17), y la verificación de formularios por navegador vs curl
+> (§6.18). Puntos que ya venían señalados y se confirman: el compilador estricto
+> y el type-check de producción (§6.16).
 
 Manual reutilizable para desplegar la combinación Astro 5 (sitio estático) +
 Payload CMS 3 (Next 15) + Postgres en Easypanel sobre un VPS propio. Surge del
@@ -826,6 +832,127 @@ código especulativo).
 
 ---
 
+> **§6.15–§6.18 — trampas del debut Astro 7 + Payload 3 (laskurain.es, 2026-07-07).**
+> Las cuatro salieron en el primer despliegue de la combinación completa. Las dos
+> primeras (build) y las dos siguientes (runtime + método de verificación) no las
+> caza el `docker build` a secas: exigen reproducir el arranque real y probar por
+> navegador. Regla transversal: **antes del primer deploy, reproduce en local el
+> build Y el arranque del contenedor** (`docker build` + `docker run` del CMD real).
+
+### 6.15 El marcador `dev` de `payload_migrations` cuelga `payload migrate` sin TTY
+
+Aplica cuando **el contenido de producción se siembra restaurando un `pg_dump` de
+la base de desarrollo** (en vez de correr el seed en prod).
+
+**Síntoma:** el contenedor del CMS entra en crash-loop en el primer arranque; el
+`CMD` (`payload migrate && next start`) nunca llega a `next start`. En un arranque
+interactivo se ve el prompt:
+
+```
+? It looks like you've run Payload in dev mode, meaning you've dynamically pushed
+  changes to your database. If you'd like to run migrations, data loss will occur.
+  Would you like to proceed? › (y/N)
+```
+
+**Causa:** una base que ha corrido en **dev con `push`** tiene, además de las
+migraciones reales, una fila especial **`dev`** (batch `-1`) en `payload_migrations`.
+`payload migrate` la detecta y **pregunta por stdin** antes de continuar. Sin TTY
+(contenedor) se queda esperando y, al cerrarse stdin, sale con **exit 1** → el `&&`
+corta → el CMS no arranca. (Es distinto del cuelgue de `payload run <script>` en
+getPayload; este es el prompt de detección de dev-push.)
+
+**Solución:** el dump de producción debe llevar `payload_migrations` **solo con las
+migraciones reales, sin la fila `dev`**. Al generar el paquete: restaurar el dump en
+una BD scratch → `DELETE FROM payload_migrations WHERE name='dev';` → **re-dump**.
+Con la fila fuera, `payload migrate` es no-op (`Reading migration files… Done.`,
+exit 0) y `next start` arranca. Verificado restaurando el dump limpio y corriendo el
+`CMD` real del contenedor.
+
+### 6.16 El type-check de `next build` (prod) es MÁS ESTRICTO que `next dev`
+
+**Síntoma:** el primer `next build` de producción del CMS muere en el type-check con
+errores que **en local con `next dev` nunca aparecieron**, p. ej.:
+
+```
+Type error: Argument of type 'PayloadRequest' is not assignable to parameter of type 'Request'.
+  Types of property 'cache' are incompatible.
+```
+
+**Causa:** `next dev` **no ejecuta el type-check completo del proyecto**; los errores
+de tipo quedan **latentes** hasta el primer `next build`. Además `next build` corta
+mostrando **un solo error cada vez** (el primero): al arreglarlo aparece el siguiente.
+
+**Solución:** arreglar el **tipado de verdad** (nunca `as any` ni
+`typescript.ignoreBuildErrors` — dejar el check activo). Ejemplos reales que salieron:
+un helper `getIp(req: Request)` que recibía un `PayloadRequest` → tiparlo por lo que
+usa (`{ headers: Headers }`); un mapa de ids de Media como `number | string` cuando en
+Postgres `Media.id` es `number`; ids de fila de **array de Payload** tratados como
+`number` cuando **son `string`**; y un loop que llamaba `updateGlobal` con `slug: string`
+(de `Object.entries`), que degrada el tipo de `data` → tipar las claves como los slugs
+literales. **Reproduce el build de producción en local antes del primer deploy:**
+
+```bash
+docker build -f apps/cms/Dockerfile .   # corre el next build real (clean install + type-check)
+```
+
+### 6.17 La config de Payload NO puede importar estáticamente nada de otro workspace (RUNTIME)
+
+**Síntoma (runtime, NO build):** el build pasa, pero el contenedor del CMS entra en
+crash-loop al arrancar:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/app/apps/web/src/content/home'
+  (al ejecutar `payload migrate` del CMD → carga payload.config → endpoints/seed.ts)
+```
+
+**Causa:** la imagen es **multi-stage** y al runner solo se copia `apps/cms` (no
+`apps/web`). Un endpoint (aquí el de seed) importaba **estáticamente** contenido de
+`apps/web/src/content/*`. Esos módulos existen en la etapa *builder* pero **no en la
+imagen final**. Como `payload migrate` **carga la config vía tsx** y la config importa
+los endpoints, resuelve el import estático → falta el módulo → crash-loop. El
+`next build` NO lo detecta: en el builder `apps/web` sí está.
+
+**Solución (sin copiar `apps/web` a la imagen):** convertir esos imports en
+**dinámicos DENTRO del handler** (`await import('...')`), de modo que solo se resuelvan
+al invocar el endpoint (deshabilitado en prod sin su secreto). Los tipos se traen con
+`typeof import(...)` (construcción de solo-tipo, se borra en runtime). **Regla general:
+la config de Payload y todo lo que ella importa (endpoints, hooks, collections, globals)
+no puede importar estáticamente nada de otro workspace.** Comprobar con
+`grep -rE "from ['\"].*<otro-workspace>/src" apps/cms/src`.
+
+**Verificación (runtime, no solo build):** reproducir el **arranque real** del contenedor:
+
+```bash
+docker build -f apps/cms/Dockerfile -t cms:verify .
+docker run -d --name cms-rt -p 3001:3000 \
+  -e DATABASE_URI="postgres://user:pass@host.docker.internal:5432/<db-restaurada>" \
+  -e PAYLOAD_SECRET="..." -e PORT=3000 cms:verify
+docker logs cms-rt   # migrate "Done." + next "Ready", SIN ERR_MODULE_NOT_FOUND
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3001/admin   # → 200
+```
+
+### 6.18 Verifica los formularios NAVEGADOR→endpoint, no solo curl→endpoint
+
+**Síntoma:** un formulario devuelve **400** desde el navegador con todos los campos
+aparentemente correctos, pero en las pruebas por `curl` **nunca falla**.
+
+**Causa:** el `curl` construye el JSON **a mano y "bien tipado"**, así que nunca
+ejercita las coerciones que hace el DOM al serializar un formulario real. El caso que
+lo destapó: un **checkbox nativo marcado**, vía `Object.fromEntries(new FormData(form))`,
+produce `consent: "on"` (string), no `true`; el endpoint validaba `consent === true` →
+`"on" !== true` → 400. `curl` mandaba `consent: true` y lo ocultaba. (Otras coerciones
+que esconde el curl: números como strings, campos vacíos vs ausentes, y el **nombre del
+campo del widget** — p. ej. Turnstile inyecta `cf-turnstile-response` salvo que fijes
+`data-response-field-name`.)
+
+**Solución:** normalizar en el cliente antes de enviar (p. ej. sobreescribir
+`data.consent = el?.checked === true`) y, sobre todo, **verificar cada formulario con un
+envío de NAVEGADOR real** contra el endpoint (con claves de test de Turnstile),
+inspeccionando status + body recibido + fila guardada. El `curl→endpoint` vale para el
+pipeline del servidor, pero **no sustituye** al `navegador→endpoint` para esta clase de bug.
+
+---
+
 ## 7. Checklist rápido para un proyecto nuevo
 
 Para el yo del futuro que ya conoce este manual. Sin explicaciones, solo
@@ -838,6 +965,11 @@ el orden.
    ```
 3. Verificar que el `.ts` generado tiene `CREATE TABLE` para todas las
    collections + globals + tablas internas de Payload.
+3b. **Reproducir en local, antes de tocar Easypanel, el build Y el arranque del
+   contenedor del CMS:** `docker build -f apps/cms/Dockerfile .` y `docker run`
+   del `CMD` real (`migrate && start`) contra una BD restaurada, hasta servir
+   `/admin` (200). Caza §6.15–§6.18 sin gastar ciclos del panel. Si siembras prod
+   con un dump de dev, límpialo del marcador `dev` (§6.15).
 4. Commit y push.
 5. **En Easypanel**, crear proyecto.
 6. Crear servicio **Postgres** (tipo "Postgres" del catálogo). Anotar
@@ -1006,6 +1138,15 @@ CORS en producción bloqueando el formulario (§6.11), HEAD vs GET en el
 endpoint de archivos (§6.12), redirect www → sin-www en el Caddy interno
 (§6.13), robots.txt apuntando al sitemap canónico, y la nueva sección
 §9 de verificaciones post-deploy.
+
+Actualizado el **2026-07-07** con el primer despliegue de la combinación
+completa **Astro 7 + Payload 3** (laskurain.es), que la deja **validada en
+producción** y aporta cuatro trampas nuevas: marcador `dev` colgando
+`migrate` al restaurar un dump de dev (§6.15), type-check de `next build`
+más estricto que dev (§6.16), la config de Payload importando de otro
+workspace y reventando en runtime (§6.17), y la verificación de formularios
+por navegador vs curl (§6.18). Lección de proceso: reproducir en local el
+`docker build` **y** el `docker run` del arranque real antes del primer deploy.
 
 Autoría: [Luismi Lascurain](https://luismilascurain.com) — consultor digital independiente en Donostia — asistido
 por Claude Code.
