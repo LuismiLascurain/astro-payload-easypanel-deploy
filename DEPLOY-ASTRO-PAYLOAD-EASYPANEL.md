@@ -953,6 +953,77 @@ pipeline del servidor, pero **no sustituye** al `navegador→endpoint` para esta
 
 ---
 
+### 6.19 `import.meta.env` sin `PUBLIC_` se hornea en el build — y el optimizador borra el código que dependía de él (y con él, sus dependencias)
+
+**Síntoma:** en producción, tres fallos aparentemente inconexos y **mudos**: el captcha
+no bloquea nada (los formularios aceptan envíos sin resolverlo), el aviso por email no
+llega **y no deja ni una línea de log**, y el contenedor arranca perfectamente. En local
+todo verde. Horas de silencio.
+
+**Causa — tres capas apiladas, cada una escondiendo a la siguiente:**
+
+1. **`import.meta.env.LO_QUE_SEA`, para variables que NO empiezan por `PUBLIC_`, lo
+   SUSTITUYE VITE EN EL BUILD** por el valor literal de ese momento. No es una lectura:
+   es una constante horneada. Si el secreto vive (bien) solo en el **runtime** del
+   contenedor, en el bundle queda `undefined`.
+2. **Y como queda constante, el optimizador razona sobre ella y BORRA CÓDIGO.** Lo que
+   se compiló de verdad:
+   ```js
+   var verifyTurnstile = async (token) => { const secret = undefined;
+                                            if (!secret) return true; ... }  // → return true
+   var sendNotification = async (subject, html) => {};   // ← la función ENTERA, vacía
+   ```
+   El captcha fallaba ABIERTO y el email ni se intentaba. El `console.error` del `catch`
+   tampoco sobrevivió: por eso no había logs — no es que el error se tragara, es que
+   **no quedaba código**.
+3. **Con el código borrado, sus dependencias desaparecen de la imagen sin que ningún
+   build lo detecte.** Nadie importaba `nodemailer`, así que nadie notó que **jamás se
+   había declarado** en `dependencies` del workspace. Al arreglar las capas 1 y 2, el
+   fallo mutó a `ERR_MODULE_NOT_FOUND: Cannot find package 'nodemailer'`.
+
+**Y una cuarta, de propina:** al declararla, seguía sin resolver **dentro de la imagen**.
+El Dockerfile aplanaba el workspace con dos `COPY` al mismo destino:
+```dockerfile
+COPY --from=builder /app/node_modules           ./node_modules
+COPY --from=builder /app/apps/web/node_modules  ./node_modules   # ← rompe los symlinks
+```
+Los symlinks de pnpm son **relativos**: `apps/web/node_modules/x → ../../../node_modules/.pnpm/…`
+resuelve bien desde `/app/apps/web/node_modules/`, pero desde `/app/node_modules/` apunta
+a `/node_modules/.pnpm/…`, **fuera del contenedor**. No se notaba porque el bundle resuelve
+Astro y compañía por rutas del store; lo único que pasa por el symlink es un
+`import('paquete')` **resuelto en RUNTIME** — y el único que había estaba dentro de la
+función que el optimizador había borrado.
+
+**Solución — tres reglas, no una:**
+
+1. **Los secretos se leen SIEMPRE en runtime.** Un helper de una línea, y prohibido
+   `import.meta.env.NOMBRE` literal para nada que no sea `PUBLIC_`:
+   ```js
+   export const env = (key) =>
+     process.env?.[key] || import.meta.env?.[key] || undefined   // clave DINÁMICA: Vite no la inlinea
+   ```
+   Y **falla cerrado**: `if (!secret) return true` no es una comodidad de desarrollo, es
+   una puerta abierta que además parece cerrada.
+2. **Toda función de efecto loguea éxito Y fallo, con causa.** Cada `return` mudo es una
+   hora de depuración a ciegas. Si el aviso no sale, en el log tiene que constar por qué:
+   qué variable falta, qué campo está vacío, qué dijo el SMTP.
+3. **El smoke test de la imagen Docker debe EJERCITAR LOS CAMINOS DE EFECTO, no solo el
+   arranque.** «El contenedor levanta y sirve HTML» no prueba nada de esto. Hay que hacer
+   el POST real contra la imagen y comprobar que el email **se intenta y se ejecuta** —
+   con un SMTP de juguete basta (≈40 líneas sin dependencias, aceptando y volcando el
+   mensaje). Verificación mínima, con build SIN secretos y runtime CON ellos:
+   ```
+   POST sin captcha  → 403 + log de rechazo
+   POST con captcha  → 200 + "aviso enviado … messageId=…" + el SMTP lo recibe
+   ```
+
+**Regla general que deja este caso:** cuando un fallo de producción no deja logs,
+sospecha primero de que **el código no exista** en el artefacto desplegado, antes que de
+la lógica. Y desconfía de los verdes: aquí hubo tres comprobaciones en verde —el build,
+el arranque del contenedor y la suite de formularios— y las tres eran ciegas al fallo.
+
+---
+
 ## 7. Checklist rápido para un proyecto nuevo
 
 Para el yo del futuro que ya conoce este manual. Sin explicaciones, solo
