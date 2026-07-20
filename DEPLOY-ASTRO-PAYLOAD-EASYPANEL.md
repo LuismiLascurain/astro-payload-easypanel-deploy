@@ -1017,6 +1017,18 @@ función que el optimizador había borrado.
    POST con captcha  → 200 + "aviso enviado … messageId=…" + el SMTP lo recibe
    ```
 
+**Quinta capa, y la más traicionera: los fallbacks que fabrican valores INVÁLIDOS.**
+Con todo lo anterior arreglado, el aviso seguía sin llegar — ahora el proveedor lo
+rechazaba: «the sender you used a6159a001@smtp-brevo.com is not valid». El código hacía
+`from: env('BREVO_FROM') || user`, y ese `|| user` —que parecía una red de seguridad—
+firmaba el mensaje con el **login SMTP**, que nunca es un remitente dado de alta.
+Mientras tanto el log decía «aviso enviado». Un valor por defecto solo es una red de
+seguridad si el valor es VÁLIDO; si no, es un fallo disfrazado de éxito, y encima
+desplaza la culpa al proveedor. Reglas que deja: **variable obligatoria sin fallback**
+cuando no existe un valor por defecto correcto, y **el log de éxito imprime los datos
+que determinan si el efecto va a funcionar** (aquí, el `from` usado) — no solo «hecho».
+Esta capa costó una iteración entera que no habría existido con el `from` en el log.
+
 **Regla general que deja este caso:** cuando un fallo de producción no deja logs,
 sospecha primero de que **el código no exista** en el artefacto desplegado, antes que de
 la lógica. Y desconfía de los verdes: aquí hubo tres comprobaciones en verde —el build,
