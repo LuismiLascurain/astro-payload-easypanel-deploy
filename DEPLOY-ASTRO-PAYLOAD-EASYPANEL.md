@@ -1034,6 +1034,76 @@ sospecha primero de que **el código no exista** en el artefacto desplegado, ant
 la lógica. Y desconfía de los verdes: aquí hubo tres comprobaciones en verde —el build,
 el arranque del contenedor y la suite de formularios— y las tres eran ciegas al fallo.
 
+### 6.20 No des de alta un dominio hasta que el DNS resuelva al VPS: Traefik NO reintenta ACME
+
+**Síntoma:** das de alta el dominio en el panel; el servicio responde perfectamente por
+HTTPS si ignoras el certificado (`curl -k` devuelve el sitio con 200), pero lo que sirve
+es el autofirmado del panel (`issuer=CN=Easypanel`) y el de Let's Encrypt no llega nunca.
+Un subdominio dado de alta **en la misma operación** sí emitió. Esa asimetría es la pista.
+
+**Causa:** al dar de alta el dominio, su registro `A` aún no había propagado. Es tentador
+razonar que da igual, porque Let's Encrypt consulta a los servidores autoritativos y esos
+ya devuelven la IP nueva. **Ese razonamiento es falso:** Let's Encrypt consulta a través de
+resolvers recursivos **con caché**, no se la salta. Con la IP vieja cacheada, el reto
+HTTP-01 se valida contra el servidor ANTIGUO y falla. El subdominio que sí emitió era el
+que ya apuntaba al VPS de antes.
+
+**Y lo que convierte el tropiezo en atasco:** el proxy de borde del panel (Traefik) **no
+reintenta la emisión por su cuenta**. Se queda esperando un cambio de configuración. Ni el
+tiempo, ni reiniciar el servicio de la aplicación, ni reiniciar el proxy lo desbloquean.
+
+**Regla:** dar de alta el dominio **solo cuando ya resuelva al VPS desde un resolver
+público**, no cuando lo haga el autoritativo:
+
+```bash
+dig +short dominio.com A @1.1.1.1
+dig +short dominio.com A @8.8.8.8     # los dos tienen que dar la IP del VPS
+```
+
+**Si ya has caído:** quitar el dominio del panel y volver a añadirlo. Eso sí fuerza una
+petición ACME limpia, y es la única salida. Con moderación: Let's Encrypt limita a 5
+validaciones fallidas por hostname y hora.
+
+#### Quién pide el certificado (determina qué tocar)
+
+Aplicable a cualquier proyecto de este manual: el servicio web lleva su propio Caddy, pero
+**solo sirve ficheros en `:3000` con `auto_https off`**. Quien termina TLS y atiende
+`/.well-known/acme-challenge/` es el proxy de borde del panel. Se distingue sin entrar al
+servidor, por la cabecera `Server` — Caddy siempre la manda, Traefik no manda ninguna:
+
+```bash
+curl -skI https://dominio.com/                          # server: Caddy → NUESTRO contenedor
+curl -sI  http://dominio.com/.well-known/acme-challenge/x   # sin Server → el proxy de borde
+```
+
+#### Leer los logs de Traefik sin sacar falsos negativos
+
+Tres trampas, las tres vividas:
+
+- **Aplicación y acceso van LOS DOS a stdout.** El truco habitual de quedarse con stderr
+  (`2>&1 1>/dev/null`) devuelve **vacío**, que se lee como "no hay errores" y no lo es.
+- **Filtra por tiempo, no por número de líneas.** En un proxy que atiende varios proyectos,
+  `--tail=5000` puede no llegar ni a hace veinte minutos. Usa `--since 4h`.
+- **`acme.json` viene formateado con espacio tras los dos puntos**, así que `grep '"main":"'`
+  falla en silencio. Usa `grep '"main": *"'`.
+
+#### El `notBefore` de Let's Encrypt está antedatado ~1 hora
+
+Lo antedata para absorber desfases de reloj entre servidores. **Leerlo como hora de emisión
+real desplaza la cronología una hora entera**, que es justo el orden de magnitud de estos
+incidentes. En el caso que originó esta sección, esa hora hizo parecer que un certificado
+era anterior a los cambios cuando se había emitido durante ellos, y de ahí salió una
+hipótesis equivocada de rate limit que costó tiempo.
+
+```bash
+openssl s_client -connect dominio.com:443 -servername dominio.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -startdate      # emisión real ≈ notBefore + 1 h
+```
+
+Y compara siempre en la MISMA referencia horaria: la cabecera `Date` del servidor viene en
+GMT y el reloj local puede ir en UTC+1/+2. Dos horas idénticas en husos distintos parecen
+una coincidencia reveladora y no lo son.
+
 ---
 
 ## 7. Checklist rápido para un proyecto nuevo
@@ -1085,8 +1155,11 @@ el orden.
     - El sitio responde en la URL temporal.
     - Las páginas del CMS (`/escritos/<slug>`, legales) están generadas.
     - GA4 y Turnstile aparecen activos si correspondía.
-12. Apuntar DNS al VPS. Esperar propagación. Easypanel saca certs Let's
-    Encrypt automáticamente.
+12. Apuntar DNS al VPS. **Esperar a que resuelva al VPS desde un resolver
+    PÚBLICO** (`dig +short dominio.com A @1.1.1.1`), no solo desde el
+    autoritativo, y SOLO ENTONCES dar de alta el dominio en el panel.
+    Hacerlo antes deja el certificado sin emitir y Traefik no reintenta
+    solo: hay que quitar el dominio y volver a ponerlo. Ver §6.20.
 13. Configurar redirecciones 301 si vienes de un sitio anterior.
     **Van dentro del Caddyfile del propio servicio web (`apps/web/Caddyfile`),
     NO en el Caddy de borde de Easypanel** — así viajan con el repo y son
@@ -1230,6 +1303,15 @@ más estricto que dev (§6.16), la config de Payload importando de otro
 workspace y reventando en runtime (§6.17), y la verificación de formularios
 por navegador vs curl (§6.18). Lección de proceso: reproducir en local el
 `docker build` **y** el `docker run` del arranque real antes del primer deploy.
+
+Actualizado el **2026-07-28** con la puesta en producción de meridacdc.com, que
+aporta §6.20: **no dar de alta un dominio hasta que el DNS resuelva al VPS desde
+un resolver público**, porque Let's Encrypt valida a través de resolvers con caché
+y Traefik **no reintenta la emisión por su cuenta** — la única salida es quitar el
+dominio y volver a ponerlo. Incluye cómo identificar qué componente pide el
+certificado (por la cabecera `Server`), cómo leer los logs de Traefik sin sacar
+falsos negativos, y el antedatado de una hora del `notBefore`, que desplaza la
+cronología justo en el orden de magnitud de estos incidentes.
 
 Autoría: [Luismi Lascurain](https://luismilascurain.com) — consultor digital independiente en Donostia — asistido
 por Claude Code.
