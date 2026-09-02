@@ -46,3 +46,19 @@ aprendió bastante más y NADA de esto está en el manual:
 Todo está en RECETA-PUBLICACION-ASTRO-PAYLOAD-EASYPANEL.md (693 líneas), en el
 repo de luismilascurain.com. Al consolidar, fusionarla con lo que salga del
 relay de scloinaz.
+
+## Cuándo
+
+Al cerrar scloinaz, no antes. Motivo: el relay scoped que se implementa allí
+cambia justo la parte de seguridad de la §6.14, y documentarlo dos veces sale
+peor. Sesión propia, no un rato entre tareas.
+
+## Al consolidar, decidir también el formato
+
+Con las 11 de scloinaz y las 4 de luismilascurain, la §6 pasa de 20 trampas a
+35. Hoy están ordenadas por orden de descubrimiento, así que para saber si una
+te aplica hay que leerlas todas.
+
+Plantearse agruparlas por FASE: build · arranque del contenedor · red y DNS ·
+datos y migraciones · sistema de ficheros (macOS vs Linux). Solo esa última
+tiene ya cinco casos de scloinaz.
