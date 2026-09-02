@@ -25,3 +25,24 @@ forma distinta. Probablemente merecen una sección propia.
 Pendiente también: fusionar la receta del botón de publicar
 (RECETA-PUBLICACION-ASTRO-PAYLOAD-EASYPANEL.md, hoy en luismilascurain.com)
 con el patrón de relay scoped que se implemente en scloinaz.
+
+## luismilascurain (agosto 2026) — §6.14 se quedó en la foto de mayo
+
+La §6.14 cubre el disparo y la trampa de la URL, pero desde entonces se
+aprendió bastante más y NADA de esto está en el manual:
+
+- El cinturón del Paso 10. Es lo más grave: un build que falla a medias
+  publica un sitio roto CON CÓDIGO 0. Pasó en vivo el 03/08/2026, 17 páginas
+  como redirecciones vacías. Causa raíz: Payload no devuelve 404 cuando un
+  documento no existe, contesta 200 con docs vacío, así que "no existe" y "no
+  he podido hablar con el CMS" caen en el mismo catch. Hoy el manual explica
+  cómo montar el botón sin avisar de esto.
+- El semáforo de estado: build.json en el front, las dos cantidades que no son
+  la misma, el bug del primer día, el estado ⚪ que dice "no lo sé".
+- El cuelgue de Corepack al forzar reconstrucción (19/08). Cero menciones.
+- La regla de cuándo forzar y cuándo no, con sus tres casos.
+- El relay scoped, hoy dos líneas de aviso sin desarrollar.
+
+Todo está en RECETA-PUBLICACION-ASTRO-PAYLOAD-EASYPANEL.md (693 líneas), en el
+repo de luismilascurain.com. Al consolidar, fusionarla con lo que salga del
+relay de scloinaz.
